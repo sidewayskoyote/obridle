@@ -1,0 +1,612 @@
+@@START:overview
+Obridle
+=======
+
+Obridle is a small LAN model manager for Ollama homelabs.
+
+It helps move selected Ollama models between Linux hosts without re-downloading the same blobs from the public registry. It uses boring tools: Ollama, ssh, rsync, jq, and Bash.
+
+Obridle is not a model registry, daemon, web UI, Hugging Face manager, or replacement for Ollama. It is a bridle: a small set of reins for a local Ollama model herd.
+
+Version target: v0.1.1 Bash draft.
+
+Core idea:
+  - Ollama knows how to pull, list, and remove models.
+  - Obridle asks Ollama to do normal Ollama things whenever possible.
+  - Obridle only touches manifests/blobs directly for the LAN transfer feature.
+  - Transfers use a staging directory first, then install into the real Ollama model store.
+
+Dependencies:
+  - bash
+  - ssh
+  - rsync
+  - jq
+  - ollama
+
+Typical install dependencies on Debian/Ubuntu/Pop/Mint:
+  sudo apt install rsync openssh-client jq
+
+Then install Ollama normally.
+@@END:overview
+
+@@START:menu
+Menu Guide
+==========
+
+Top-level menu:
+
+obridle
+A small LAN model manager for Ollama.
+
+1. Local models
+2. Master models
+3. Copy model from master
+4. Push model to master
+5. Pull model from registry
+6. Remove local model
+7. Host/network tools
+8. Management/settings
+h. Help
+q. Quit
+
+1. Local models
+   Shows local Ollama models, model-store size, and local model manifest/blob inspection.
+
+2. Master models
+   Shows Ollama models and model-store size on the configured master host.
+
+3. Copy model from master
+   Copies one selected model from the master host to the local host by copying the manifest and referenced blobs.
+
+4. Push model to master
+   Pushes one selected local model to the master host by copying the manifest and referenced blobs.
+
+5. Pull model from registry
+   Runs ollama pull MODEL locally.
+
+6. Remove local model
+   Runs ollama rm MODEL locally after confirmation.
+
+7. Host/network tools
+   Lists hosts, adds host stubs, tests SSH/Ollama, compares local models to another host, and shows a simple host/model map.
+
+8. Management/settings
+   Shows config values, config path, and lets you open the config in your editor.
+
+h. Help
+   Opens this help menu. Help regions can also be read from the command line:
+     obridle help config
+     obridle help copy
+     obridle help push
+@@END:menu
+
+@@START:config
+Config
+======
+
+v0.1 uses one simple config file:
+
+  ~/.obridle-config
+
+This is intentionally boring and portable. It is a shell-style config file read by Bash.
+
+Example:
+
+  # ~/.obridle-config
+
+  OBRIDLE_MODELS_DIR="/usr/share/ollama/.ollama/models"
+  OBRIDLE_STAGE_DIR="$HOME/.cache/obridle/stage"
+
+  OBRIDLE_MASTER_NAME="bigbrainz"
+  OBRIDLE_MASTER_USER="koyote"
+  OBRIDLE_MASTER_HOST="192.168.1.168"
+  OBRIDLE_MASTER_MODELS_DIR="/usr/share/ollama/.ollama/models"
+
+  OBRIDLE_HOSTS="
+  bigbrainz|koyote|192.168.1.168|/usr/share/ollama/.ollama/models|master RTX3060 12GB
+  brainz|koyote|192.168.1.170|/usr/share/ollama/.ollama/models|T1000 8GB
+  "
+
+No-config behavior:
+
+Obridle does not force a first-run wizard. If a chosen action needs a missing value, Obridle asks for that value at the moment it is needed.
+
+Example:
+
+  No master configured.
+  Enter master SSH target, e.g. koyote@192.168.1.168:
+  Remote Ollama models directory [/usr/share/ollama/.ollama/models]:
+  Save this as master in ~/.obridle-config? [y/N]
+
+This keeps a fresh install from getting stuck in setup before the user understands the tool.
+
+Future config direction:
+
+Later versions may add a fuller ~/.config/obridle directory, profiles, host sync, and config import/export. v0.1 keeps one file.
+@@END:config
+
+@@START:storage
+Ollama Storage Layout
+=====================
+
+On a standard Linux Ollama install, the model store is usually:
+
+  /usr/share/ollama/.ollama/models
+
+Important subdirectories:
+
+  manifests/
+  blobs/
+
+A model tag maps to a manifest path.
+
+Example:
+
+  mistral:7b-instruct-q4_K_M
+
+usually maps to:
+
+  manifests/registry.ollama.ai/library/mistral/7b-instruct-q4_K_M
+
+A namespaced model:
+
+  CognitiveComputations/dolphin-mistral-nemo:12b
+
+usually maps to:
+
+  manifests/registry.ollama.ai/CognitiveComputations/dolphin-mistral-nemo/12b
+
+A model with no explicit tag is treated as latest:
+
+  gemma2
+
+maps like:
+
+  manifests/registry.ollama.ai/library/gemma2/latest
+
+The manifest JSON names content-addressed layer digests such as:
+
+  sha256:abc123...
+
+The matching blob filename replaces the colon with a dash:
+
+  blobs/sha256-abc123...
+
+Obridle's selective copy feature copies:
+
+  1. the model manifest
+  2. only the blobs referenced by that manifest
+
+v0.1 does not manually delete shared blobs. Removal uses:
+
+  ollama rm MODEL
+@@END:storage
+
+@@START:copy
+Copy Model From Master
+======================
+
+Copy means:
+
+  master -> local
+
+Example:
+
+  obridle copy dolphin-llama3:8b
+
+Interactive menu path:
+
+  3. Copy model from master
+
+Flow:
+
+  1. Resolve the master SSH target.
+  2. Resolve the model's manifest path.
+  3. Rsync the manifest from master to the local staging directory.
+  4. Parse the manifest locally with jq.
+  5. Rsync only the referenced blob files from master to local staging.
+  6. Ask before installing into the real local Ollama model store.
+  7. Use sudo locally to install staged files into the model store.
+  8. chown the model store to ollama:ollama when possible.
+  9. Restart Ollama when systemctl is available.
+  10. Offer to remove the stage directory.
+
+Default local staging area:
+
+  ~/.cache/obridle/stage/from-master/models
+
+Default local model store:
+
+  /usr/share/ollama/.ollama/models
+
+Obridle does not store passwords. SSH and sudo handle authentication.
+@@END:copy
+
+@@START:push
+Push Model To Master
+====================
+
+Push means:
+
+  local -> master
+
+Older notes may call this "save to master." The user-facing verb is now push.
+
+Example:
+
+  obridle push qwen3:4b
+
+Alias:
+
+  obridle save qwen3:4b
+
+Interactive menu path:
+
+  4. Push model to master
+
+Flow:
+
+  1. Resolve the local model's manifest path.
+  2. Parse the local manifest with jq.
+  3. Stage the manifest and referenced blobs locally.
+  4. Rsync the staged files to the master's staging directory.
+  5. Ask before installing into the master's real Ollama model store.
+  6. Use ssh -t so remote sudo can ask for a password if needed.
+  7. Install staged files into the master's model store.
+  8. chown the model store to ollama:ollama when possible.
+  9. Restart Ollama when systemctl is available.
+  10. Remove the remote staging copy after successful install.
+
+Remote staging area:
+
+  ~/.cache/obridle/stage/incoming-HOSTNAME/models
+
+Push is useful when a small node has a model that the master does not have yet, or when a node pulled a model overnight and you want to preserve it in the canonical hoard.
+@@END:push
+
+@@START:ssh
+SSH, Passwords, and Keys
+========================
+
+Obridle uses normal ssh and rsync behavior.
+
+Supported:
+
+  - SSH keys
+  - SSH password prompts
+  - local sudo prompts
+  - remote sudo prompts through ssh -t
+
+Not supported:
+
+  - storing passwords in Obridle
+  - managing SSH keys for you
+  - bypassing sudo policy
+
+Recommended setup:
+
+  1. Make sure you can SSH to the host manually.
+  2. Make sure rsync exists on both machines.
+  3. Optionally set up SSH keys.
+
+Manual test:
+
+  ssh koyote@192.168.1.170 'hostname; ollama list'
+
+If that works, Obridle can probably talk to that host.
+
+
+Ollama store permissions:
+
+On many Linux installs, Ollama stores models under:
+
+  /usr/share/ollama/.ollama/models
+
+The Ollama service can read this directory, but your shell user may not be able to. Obridle needs read access to manifests and blobs for selective LAN copy/push.
+
+Recommended:
+
+  sudo usermod -aG ollama "$USER"
+
+Then log out/in, reboot, or activate the group in the current shell:
+
+  newgrp ollama
+
+Check:
+
+  groups
+  test -r /usr/share/ollama/.ollama/models && echo readable
+
+If ownership or group permissions are damaged:
+
+  sudo chown -R ollama:ollama /usr/share/ollama/.ollama
+  sudo chmod -R g+rX /usr/share/ollama/.ollama
+
+Names and addresses:
+
+Obridle can use anything ssh can resolve:
+
+  - 192.168.1.170
+  - brainz
+  - brainz.local
+  - koyote@192.168.1.170
+
+The config may store separate user and host fields, but raw SSH targets also work in prompts.
+@@END:ssh
+
+@@START:staging
+Staging and Sudo
+================
+
+Obridle stages transfers before installing them into the real Ollama model store.
+
+Why?
+
+Because direct remote sudo rsync often fails when sudo needs a password:
+
+  sudo: a terminal is required to read the password
+
+So Obridle avoids that path.
+
+Copy from master to local:
+
+  master model store
+    -> rsync over ssh
+  local ~/.cache/obridle/stage/from-master/models
+    -> sudo rsync locally
+  local /usr/share/ollama/.ollama/models
+
+Push to master:
+
+  local model store
+    -> local stage
+    -> rsync over ssh
+  master ~/.cache/obridle/stage/incoming-HOSTNAME/models
+    -> ssh -t master sudo rsync
+  master /usr/share/ollama/.ollama/models
+
+After installation, Obridle asks whether to clean the stage directory.
+
+Default:
+
+  Clean stage directory? [Y/n]
+
+Keeping the stage can help debug failed transfers but costs disk space.
+@@END:staging
+
+@@START:safety
+Safety Rules
+============
+
+Obridle v0.1 follows these safety rules:
+
+  - Do not store passwords.
+  - Use ssh and sudo prompts normally.
+  - Use Ollama itself whenever possible.
+  - Use ollama rm for model deletion.
+  - Do not manually delete shared Ollama blobs in v0.1.
+  - Do not use rsync --delete by default.
+  - Stage before installing into /usr/share.
+  - Ask before removing local models.
+  - Ask before installing staged files.
+  - Ask before cleaning stage directories.
+  - Do not pretend to be a full registry.
+
+Obridle's job is orchestration, not heroics.
+
+If something is weird, verify manually:
+
+  ollama list
+  du -sh /usr/share/ollama/.ollama/models
+  find /usr/share/ollama/.ollama/models/manifests -type f | head
+@@END:safety
+
+@@START:project-map
+Project Functionality Map
+=========================
+
+Purpose:
+
+  Move selected Ollama models between LAN Linux hosts without re-downloading.
+
+Primary user:
+
+  Homelab users with multiple Ollama boxes, slow or metered internet, and a desire not to download the same 9GB model five times.
+
+Non-goals:
+
+  - Not a model registry.
+  - Not a daemon.
+  - Not a web UI.
+  - Not a replacement for Ollama.
+  - Not a Hugging Face manager.
+  - Not a GGUF vault manager in v0.1.
+
+Core nouns:
+
+  local
+    The host running obridle.
+
+  master
+    The canonical model hoard/server.
+
+  host
+    Any known LAN machine.
+
+  model
+    An Ollama tag such as mistral:7b-instruct-q4_K_M.
+
+  manifest
+    Ollama metadata file naming model layers/blobs.
+
+  blob
+    Content-addressed model layer file.
+
+  stage
+    Temporary transfer area before sudo install.
+
+Core verbs:
+
+  list
+  copy
+  push
+  pull
+  remove
+  compare
+  map
+  configure
+
+v0.1 must:
+
+  - list local models
+  - list master models
+  - copy model from master to local
+  - push local model to master
+  - pull model from registry
+  - remove local model using ollama rm
+  - add/list/test hosts
+  - show help regions
+  - use staging
+  - support password SSH and SSH keys by relying on ssh
+
+v0.1 should:
+
+  - show model store sizes
+  - compare local/master or local/host
+  - show a simple host/model map
+  - keep file count low
+
+v0.1 will not:
+
+  - manage GGUF vaults
+  - run a registry
+  - delete orphan blobs manually
+  - provide web UI
+  - require Python or venv
+
+Likely future features:
+
+  - profiles: named desired model sets
+  - profile apply: copy missing profile models to a host
+  - safer config sync between hosts
+  - better matrix view
+  - optional Mac support polishing
+  - manual repair mode for broken stores
+  - import/export inventory snapshots
+  - smarter model-size reporting
+  - optional strict mirror mode with explicit --delete protections
+@@END:project-map
+
+@@START:dev-notes
+Development Notes
+=================
+
+Current design choices:
+
+  - Language: Bash for v0.1.
+  - Dependencies: bash, ssh, rsync, jq, ollama.
+  - Main executable: obridle.
+  - Help file: obridle-help.txt.
+  - Config file: ~/.obridle-config.
+  - Default stage dir: ~/.cache/obridle/stage.
+  - Default Linux model dir: /usr/share/ollama/.ollama/models.
+
+Why Bash?
+
+  The tool mostly coordinates existing Unix tools. Bash keeps the first version runnable on base-ish Linux systems without a Python venv.
+
+Why jq?
+
+  Ollama manifests are JSON. Parsing JSON with sed/awk is avoidable misery. jq is a small and reasonable dependency.
+
+Mac posture:
+
+  The code should avoid Linux-only assumptions where practical, but v0.1 is Linux-first because standard Linux Ollama service installs use /usr/share/ollama/.ollama/models. macOS typically uses a user model directory instead. A later version can auto-detect the model store.
+
+Windows posture:
+
+  Windows is not a v0.1 target.
+
+Design preference:
+
+  Obridle should use Ollama for Ollama operations whenever possible. Direct manifest/blob work exists only for selective LAN copy/push.
+@@END:dev-notes
+
+@@START:worker-prompt
+Worker Prompt
+=============
+
+You are helping develop Obridle, a small LAN model manager for Ollama homelabs.
+
+Current implementation target:
+
+v0.1 is a Bash-first tool with a menu UI and CLI one-liners. The first version should be useful, safe, and modest, but the project may grow later. Do not treat v0.1 as the whole universe.
+
+Core goal:
+
+Help users move selected Ollama models between Linux hosts on a local network without re-downloading from the Ollama registry. Use Ollama itself whenever possible for normal model operations. Use direct manifest/blob copying only for the LAN transfer feature.
+
+Design constraints for v0.1:
+
+- Bash, not Python.
+- Avoid venvs and heavy dependencies.
+- Allowed dependencies: bash, ssh, rsync, jq, ollama.
+- Primary executable: obridle.
+- Single help file: obridle-help.txt.
+- Config file: ~/.obridle-config.
+- Help regions use lowercase markers such as @@START:config and @@END:config.
+- Menu UI first; CLI one-liners also supported.
+- Do not store passwords.
+- Support normal SSH password prompts and SSH keys.
+- Use staging directories instead of direct remote sudo rsync.
+- Default stage dir: ~/.cache/obridle/stage.
+- Do not manually delete shared Ollama blobs in v0.1.
+- Use ollama rm for removals.
+- Never use rsync --delete by default.
+
+Top-level menu:
+
+obridle
+A small LAN model manager for Ollama.
+
+1. Local models
+2. Master models
+3. Copy model from master
+4. Push model to master
+5. Pull model from registry
+6. Remove local model
+7. Host/network tools
+8. Management/settings
+h. Help
+q. Quit
+
+No-config behavior:
+
+Do not force a first-run wizard. If a user chooses an action requiring missing config, prompt only for that missing value. Offer to save it to ~/.obridle-config.
+
+Storage:
+
+Default Linux Ollama model store:
+
+  /usr/share/ollama/.ollama/models
+
+Important subdirectories:
+
+  manifests/
+  blobs/
+
+Use ~/.cache/obridle/stage for temporary transfer staging. After installing staged files into the real Ollama model directory, offer to remove the staged copy.
+
+Project posture:
+
+Obridle is not a registry, daemon, web UI, Hugging Face manager, or replacement for Ollama. It is a small orchestration tool around Ollama, ssh, rsync, jq, and Bash.
+
+Coding style:
+
+- Use clear Bash functions.
+- Quote variables.
+- Prefer readable, boring code over clever shell tricks.
+- Print or describe risky actions before doing them.
+- Ask before installing, overwriting config, restarting Ollama, or removing models.
+- Keep future growth in mind without overbuilding v0.1.
+@@END:worker-prompt

@@ -1,0 +1,720 @@
+#!/usr/bin/env bash
+# obridle - a small LAN model manager for Ollama
+# v0.1.0 draft
+
+set -o pipefail
+
+OBRIDLE_VERSION="0.1.0-draft"
+OBRIDLE_CONFIG="${OBRIDLE_CONFIG:-$HOME/.obridle-config}"
+OBRIDLE_MODELS_DIR="${OBRIDLE_MODELS_DIR:-/usr/share/ollama/.ollama/models}"
+OBRIDLE_STAGE_DIR="${OBRIDLE_STAGE_DIR:-$HOME/.cache/obridle/stage}"
+OBRIDLE_HELP_FILE=""
+
+# Optional config values. These may be loaded from ~/.obridle-config.
+OBRIDLE_MASTER_NAME="${OBRIDLE_MASTER_NAME:-}"
+OBRIDLE_MASTER_USER="${OBRIDLE_MASTER_USER:-}"
+OBRIDLE_MASTER_HOST="${OBRIDLE_MASTER_HOST:-}"
+OBRIDLE_MASTER_MODELS_DIR="${OBRIDLE_MASTER_MODELS_DIR:-/usr/share/ollama/.ollama/models}"
+OBRIDLE_HOSTS="${OBRIDLE_HOSTS:-}"
+
+pause() {
+  printf '\nPress Enter to continue...'
+  read -r _
+}
+
+say() { printf '%s\n' "$*"; }
+warn() { printf 'obridle: %s\n' "$*" >&2; }
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+check_core_deps() {
+  local missing=0
+  for cmd in bash ssh rsync jq; do
+    if ! need_cmd "$cmd"; then
+      warn "missing dependency: $cmd"
+      missing=1
+    fi
+  done
+  if [[ "$missing" -ne 0 ]]; then
+    cat <<'MSG'
+
+Install dependencies on Debian/Ubuntu/Pop/Mint:
+  sudo apt install rsync openssh-client jq
+
+Ollama is also required for local list, pull, and remove operations.
+MSG
+    return 1
+  fi
+}
+
+load_config() {
+  if [[ -f "$OBRIDLE_CONFIG" ]]; then
+    # shellcheck disable=SC1090
+    source "$OBRIDLE_CONFIG"
+  fi
+  OBRIDLE_MODELS_DIR="${OBRIDLE_MODELS_DIR:-/usr/share/ollama/.ollama/models}"
+  OBRIDLE_STAGE_DIR="${OBRIDLE_STAGE_DIR:-$HOME/.cache/obridle/stage}"
+  OBRIDLE_MASTER_MODELS_DIR="${OBRIDLE_MASTER_MODELS_DIR:-/usr/share/ollama/.ollama/models}"
+}
+
+save_master_config_prompt() {
+  local target="$1" models_dir="$2"
+  printf 'Save this as master in %s? [y/N] ' "$OBRIDLE_CONFIG"
+  read -r ans
+  case "$ans" in
+    y|Y|yes|YES)
+      mkdir -p "$(dirname "$OBRIDLE_CONFIG")" 2>/dev/null || true
+      local user host
+      if [[ "$target" == *@* ]]; then
+        user="${target%@*}"
+        host="${target#*@}"
+      else
+        user="${USER:-}"
+        host="$target"
+      fi
+      {
+        printf '# obridle config\n'
+        printf 'OBRIDLE_MODELS_DIR=%q\n' "$OBRIDLE_MODELS_DIR"
+        printf 'OBRIDLE_STAGE_DIR=%q\n' "$OBRIDLE_STAGE_DIR"
+        printf 'OBRIDLE_MASTER_NAME=%q\n' "master"
+        printf 'OBRIDLE_MASTER_USER=%q\n' "$user"
+        printf 'OBRIDLE_MASTER_HOST=%q\n' "$host"
+        printf 'OBRIDLE_MASTER_MODELS_DIR=%q\n' "$models_dir"
+      } >> "$OBRIDLE_CONFIG"
+      say "Saved master to $OBRIDLE_CONFIG"
+      ;;
+  esac
+}
+
+master_target() {
+  if [[ -n "$OBRIDLE_MASTER_HOST" ]]; then
+    if [[ -n "$OBRIDLE_MASTER_USER" ]]; then
+      printf '%s@%s' "$OBRIDLE_MASTER_USER" "$OBRIDLE_MASTER_HOST"
+    else
+      printf '%s' "$OBRIDLE_MASTER_HOST"
+    fi
+    return 0
+  fi
+  return 1
+}
+
+prompt_master_target() {
+  local target
+  if target="$(master_target)"; then
+    printf '%s' "$target"
+    return 0
+  fi
+  say "No master configured."
+  printf 'Enter master SSH target, e.g. koyote@192.168.1.168: '
+  read -r target
+  if [[ -z "$target" ]]; then
+    return 1
+  fi
+  local dir
+  printf 'Remote Ollama models directory [%s]: ' "$OBRIDLE_MASTER_MODELS_DIR"
+  read -r dir
+  dir="${dir:-$OBRIDLE_MASTER_MODELS_DIR}"
+  OBRIDLE_MASTER_MODELS_DIR="$dir"
+  save_master_config_prompt "$target" "$dir"
+  printf '%s' "$target"
+}
+
+find_help_file() {
+  local script_dir
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+  for candidate in \
+    "$script_dir/obridle-help.txt" \
+    "$HOME/.local/share/obridle/obridle-help.txt" \
+    "/usr/local/share/obridle-help.txt" \
+    "/usr/local/share/obridle/obridle-help.txt"; do
+    if [[ -f "$candidate" ]]; then
+      OBRIDLE_HELP_FILE="$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+show_help_region() {
+  local region="${1:-overview}"
+  region="$(printf '%s' "$region" | tr '[:upper:]' '[:lower:]')"
+  if find_help_file; then
+    awk -v r="$region" '
+      $0 == "@@START:" r {flag=1; next}
+      $0 == "@@END:" r {flag=0}
+      flag {print}
+    ' "$OBRIDLE_HELP_FILE"
+  else
+    cat <<MSG
+obridle $OBRIDLE_VERSION
+A small LAN model manager for Ollama.
+
+Help file not found. Put obridle-help.txt next to the obridle script,
+or install it to /usr/local/share/obridle-help.txt.
+MSG
+  fi
+}
+
+help_menu() {
+  while true; do
+    clear 2>/dev/null || true
+    cat <<'MENU'
+Help
+
+1. Overview
+2. Menu guide
+3. Config
+4. Ollama storage layout
+5. Copy from master
+6. Push to master
+7. SSH, passwords, and keys
+8. Staging and sudo
+9. Safety rules
+10. Project functionality map
+11. Development notes
+12. Worker prompt
+b. Back
+MENU
+    printf '> '
+    read -r choice
+    clear 2>/dev/null || true
+    case "$choice" in
+      1) show_help_region overview; pause ;;
+      2) show_help_region menu; pause ;;
+      3) show_help_region config; pause ;;
+      4) show_help_region storage; pause ;;
+      5) show_help_region copy; pause ;;
+      6) show_help_region push; pause ;;
+      7) show_help_region ssh; pause ;;
+      8) show_help_region staging; pause ;;
+      9) show_help_region safety; pause ;;
+      10) show_help_region project-map; pause ;;
+      11) show_help_region dev-notes; pause ;;
+      12) show_help_region worker-prompt; pause ;;
+      b|B|q|Q) return 0 ;;
+    esac
+  done
+}
+
+model_to_manifest_relpath() {
+  local model="$1" name tag registry="registry.ollama.ai"
+  if [[ "$model" == *":"* ]]; then
+    name="${model%%:*}"
+    tag="${model##*:}"
+  else
+    name="$model"
+    tag="latest"
+  fi
+  if [[ "$name" == */* ]]; then
+    printf 'manifests/%s/%s/%s' "$registry" "$name" "$tag"
+  else
+    printf 'manifests/%s/library/%s/%s' "$registry" "$name" "$tag"
+  fi
+}
+
+blob_files_from_manifest() {
+  local manifest="$1"
+  jq -r '.. | objects | .digest? // empty' "$manifest" | sed 's/:/-/' | sed 's#^#blobs/#' | sort -u
+}
+
+local_ollama_list() {
+  if ! need_cmd ollama; then
+    warn "ollama command not found"
+    return 1
+  fi
+  ollama list
+}
+
+remote_ollama_list() {
+  local target="$1"
+  ssh "$target" 'ollama list'
+}
+
+local_models_menu() {
+  while true; do
+    clear 2>/dev/null || true
+    cat <<'MENU'
+Local models
+
+1. Show local Ollama models
+2. Show local model store size
+3. Inspect local model manifest/blobs
+b. Back
+MENU
+    printf '> '
+    read -r choice
+    case "$choice" in
+      1) local_ollama_list; pause ;;
+      2) du -sh "$OBRIDLE_MODELS_DIR" 2>/dev/null || warn "cannot read $OBRIDLE_MODELS_DIR"; pause ;;
+      3) inspect_local_model_interactive; pause ;;
+      b|B|q|Q) return 0 ;;
+    esac
+  done
+}
+
+master_models_menu() {
+  local target
+  target="$(prompt_master_target)" || return 1
+  while true; do
+    clear 2>/dev/null || true
+    cat <<MENU
+Master models: $target
+
+1. Show master Ollama models
+2. Show master model store size
+3. Inspect model on master
+b. Back
+MENU
+    printf '> '
+    read -r choice
+    case "$choice" in
+      1) remote_ollama_list "$target"; pause ;;
+      2) ssh "$target" "du -sh '$OBRIDLE_MASTER_MODELS_DIR'"; pause ;;
+      3) inspect_remote_model_interactive "$target" "$OBRIDLE_MASTER_MODELS_DIR"; pause ;;
+      b|B|q|Q) return 0 ;;
+    esac
+  done
+}
+
+inspect_local_model_interactive() {
+  printf 'Model name/tag: '
+  read -r model
+  [[ -z "$model" ]] && return 1
+  local rel manifest
+  rel="$(model_to_manifest_relpath "$model")"
+  manifest="$OBRIDLE_MODELS_DIR/$rel"
+  say "Manifest: $manifest"
+  if [[ ! -f "$manifest" ]]; then
+    warn "manifest not found"
+    return 1
+  fi
+  say "Referenced blobs:"
+  blob_files_from_manifest "$manifest" | while read -r blob; do
+    [[ -z "$blob" ]] && continue
+    if [[ -f "$OBRIDLE_MODELS_DIR/$blob" ]]; then
+      du -h "$OBRIDLE_MODELS_DIR/$blob"
+    else
+      say "MISSING $blob"
+    fi
+  done
+}
+
+inspect_remote_model_interactive() {
+  local target="$1" dir="$2"
+  printf 'Model name/tag: '
+  read -r model
+  [[ -z "$model" ]] && return 1
+  local rel
+  rel="$(model_to_manifest_relpath "$model")"
+  say "Remote manifest: $dir/$rel"
+  ssh "$target" "test -f '$dir/$rel' && jq -r '.. | objects | .digest? // empty' '$dir/$rel' | sed 's/:/-/' | sed 's#^#blobs/#' | sort -u | while read b; do test -f '$dir/'\"\$b\" && du -h '$dir/'\"\$b\" || echo MISSING \"\$b\"; done || echo manifest not found"
+}
+
+install_stage_to_local() {
+  local stage_models="$1"
+  say "Installing staged files into $OBRIDLE_MODELS_DIR"
+  sudo mkdir -p "$OBRIDLE_MODELS_DIR"
+  sudo rsync -avh "$stage_models/" "$OBRIDLE_MODELS_DIR/"
+  sudo chown -R ollama:ollama "$OBRIDLE_MODELS_DIR" 2>/dev/null || warn "could not chown to ollama:ollama; check service user"
+  sudo systemctl restart ollama 2>/dev/null || warn "could not restart ollama with systemctl; restart manually if needed"
+}
+
+cleanup_stage_prompt() {
+  local dir="$1"
+  printf 'Clean stage directory %s? [Y/n] ' "$dir"
+  read -r ans
+  case "$ans" in
+    n|N|no|NO) say "Leaving stage directory in place." ;;
+    *) rm -rf "$dir"; say "Stage cleaned." ;;
+  esac
+}
+
+copy_model_from_master() {
+  local model="$1" target rel stage_models manifest_stage
+  if [[ -z "$model" ]]; then
+    printf 'Model to copy from master: '
+    read -r model
+  fi
+  [[ -z "$model" ]] && return 1
+  target="$(prompt_master_target)" || return 1
+  rel="$(model_to_manifest_relpath "$model")"
+  stage_models="$OBRIDLE_STAGE_DIR/from-master/models"
+  manifest_stage="$stage_models/$rel"
+  mkdir -p "$(dirname "$manifest_stage")" "$stage_models/blobs"
+  say "Copying manifest for $model from $target..."
+  rsync -avh --progress "$target:$OBRIDLE_MASTER_MODELS_DIR/$rel" "$manifest_stage" || return 1
+  say "Reading referenced blobs..."
+  local blob listfile
+  listfile="$OBRIDLE_STAGE_DIR/from-master/blob-list.txt"
+  mkdir -p "$(dirname "$listfile")"
+  blob_files_from_manifest "$manifest_stage" > "$listfile"
+  while IFS= read -r blob; do
+    [[ -z "$blob" ]] && continue
+    mkdir -p "$stage_models/$(dirname "$blob")"
+    say "Copying $blob"
+    rsync -avh --progress "$target:$OBRIDLE_MASTER_MODELS_DIR/$blob" "$stage_models/$blob" || return 1
+  done < "$listfile"
+  printf 'Install staged model into local Ollama store now? [Y/n] '
+  read -r ans
+  case "$ans" in
+    n|N|no|NO) say "Model staged at $stage_models" ;;
+    *) install_stage_to_local "$stage_models"; local_ollama_list ; cleanup_stage_prompt "$OBRIDLE_STAGE_DIR/from-master" ;;
+  esac
+}
+
+push_model_to_master() {
+  local model="$1" target rel manifest stage_models remote_stage remote_models_dir
+  if [[ -z "$model" ]]; then
+    printf 'Model to push to master: '
+    read -r model
+  fi
+  [[ -z "$model" ]] && return 1
+  target="$(prompt_master_target)" || return 1
+  rel="$(model_to_manifest_relpath "$model")"
+  manifest="$OBRIDLE_MODELS_DIR/$rel"
+  if [[ ! -f "$manifest" ]]; then
+    warn "local manifest not found: $manifest"
+    return 1
+  fi
+  stage_models="$OBRIDLE_STAGE_DIR/to-master/models"
+  rm -rf "$OBRIDLE_STAGE_DIR/to-master"
+  mkdir -p "$(dirname "$stage_models/$rel")" "$stage_models/blobs"
+  cp "$manifest" "$stage_models/$rel"
+  while IFS= read -r blob; do
+    [[ -z "$blob" ]] && continue
+    if [[ ! -f "$OBRIDLE_MODELS_DIR/$blob" ]]; then
+      warn "missing local blob: $blob"
+      return 1
+    fi
+    mkdir -p "$stage_models/$(dirname "$blob")"
+    cp "$OBRIDLE_MODELS_DIR/$blob" "$stage_models/$blob"
+  done < <(blob_files_from_manifest "$manifest")
+  remote_stage="\$HOME/.cache/obridle/stage/incoming-$(hostname -s 2>/dev/null || echo local)"
+  remote_models_dir="$OBRIDLE_MASTER_MODELS_DIR"
+  say "Pushing staged model to $target:$remote_stage"
+  ssh "$target" "mkdir -p $remote_stage"
+  rsync -avh --progress "$stage_models/" "$target:$remote_stage/models/" || return 1
+  printf 'Install staged model into master Ollama store now over ssh -t? [Y/n] '
+  read -r ans
+  case "$ans" in
+    n|N|no|NO)
+      say "Model staged on master at $remote_stage/models"
+      ;;
+    *)
+      ssh -t "$target" "sudo mkdir -p '$remote_models_dir' && sudo rsync -avh '$remote_stage/models/' '$remote_models_dir/' && sudo chown -R ollama:ollama '$remote_models_dir' 2>/dev/null || true; sudo systemctl restart ollama 2>/dev/null || true; ollama list; rm -rf '$remote_stage'"
+      rm -rf "$OBRIDLE_STAGE_DIR/to-master"
+      ;;
+  esac
+}
+
+pull_model() {
+  local model="$1"
+  if [[ -z "$model" ]]; then
+    printf 'Model to pull from Ollama registry: '
+    read -r model
+  fi
+  [[ -z "$model" ]] && return 1
+  ollama pull "$model"
+}
+
+remove_local_model() {
+  local model="$1"
+  if [[ -z "$model" ]]; then
+    local_ollama_list
+    printf 'Model to remove locally with ollama rm: '
+    read -r model
+  fi
+  [[ -z "$model" ]] && return 1
+  printf 'Remove local model %s using ollama rm? [y/N] ' "$model"
+  read -r ans
+  case "$ans" in
+    y|Y|yes|YES) ollama rm "$model" ;;
+    *) say "Cancelled." ;;
+  esac
+}
+
+list_hosts() {
+  if [[ -z "$OBRIDLE_HOSTS" ]]; then
+    say "No hosts configured in $OBRIDLE_CONFIG"
+    return 0
+  fi
+  printf '%-16s %-12s %-24s %s\n' "NAME" "USER" "HOST" "NOTES"
+  printf '%s\n' "$OBRIDLE_HOSTS" | sed '/^[[:space:]]*$/d' | while IFS='|' read -r name user host dir notes; do
+    printf '%-16s %-12s %-24s %s\n' "$name" "$user" "$host" "$notes"
+  done
+}
+
+add_host_interactive() {
+  local name user host dir notes line
+  printf 'Host nickname: '; read -r name
+  printf 'SSH user [%s]: ' "${USER:-}"; read -r user; user="${user:-${USER:-}}"
+  printf 'Host/IP/resolver name: '; read -r host
+  printf 'Ollama models dir [/usr/share/ollama/.ollama/models]: '; read -r dir; dir="${dir:-/usr/share/ollama/.ollama/models}"
+  printf 'Notes: '; read -r notes
+  [[ -z "$name" || -z "$host" ]] && { warn "name and host required"; return 1; }
+  line="$name|$user|$host|$dir|$notes"
+  mkdir -p "$(dirname "$OBRIDLE_CONFIG")" 2>/dev/null || true
+  if [[ ! -f "$OBRIDLE_CONFIG" ]]; then
+    printf '# obridle config\n' > "$OBRIDLE_CONFIG"
+  fi
+  if ! grep -q '^OBRIDLE_HOSTS=' "$OBRIDLE_CONFIG" 2>/dev/null; then
+    cat >> "$OBRIDLE_CONFIG" <<EOF2
+
+OBRIDLE_HOSTS="
+$line
+"
+EOF2
+  else
+    warn "OBRIDLE_HOSTS already exists. Edit $OBRIDLE_CONFIG to add:"
+    say "$line"
+  fi
+  say "Host recorded or ready to add. Reload obridle to use edited config."
+}
+
+host_target_from_name() {
+  local query="$1"
+  printf '%s\n' "$OBRIDLE_HOSTS" | sed '/^[[:space:]]*$/d' | while IFS='|' read -r name user host dir notes; do
+    if [[ "$name" == "$query" || "$host" == "$query" ]]; then
+      if [[ -n "$user" ]]; then printf '%s@%s' "$user" "$host"; else printf '%s' "$host"; fi
+      return 0
+    fi
+  done | head -n 1
+}
+
+host_dir_from_name() {
+  local query="$1"
+  printf '%s\n' "$OBRIDLE_HOSTS" | sed '/^[[:space:]]*$/d' | while IFS='|' read -r name user host dir notes; do
+    if [[ "$name" == "$query" || "$host" == "$query" ]]; then
+      printf '%s' "${dir:-/usr/share/ollama/.ollama/models}"
+      return 0
+    fi
+  done | head -n 1
+}
+
+test_host_interactive() {
+  printf 'Host nickname/IP/SSH target: '
+  read -r h
+  [[ -z "$h" ]] && return 1
+  local target
+  target="$(host_target_from_name "$h")"
+  target="${target:-$h}"
+  ssh "$target" 'hostname; command -v ollama >/dev/null && ollama list || echo "ollama not found"; df -h / 2>/dev/null | tail -n +1'
+}
+
+compare_local_to_host() {
+  local h="$1" target tmp_local tmp_remote
+  if [[ -z "$h" ]]; then
+    printf 'Compare local to host: '
+    read -r h
+  fi
+  [[ -z "$h" ]] && return 1
+  target="$(host_target_from_name "$h")"
+  target="${target:-$h}"
+  tmp_local="$(mktemp)"
+  tmp_remote="$(mktemp)"
+  ollama list | awk 'NR>1 {print $1}' | sort > "$tmp_local"
+  ssh "$target" 'ollama list' | awk 'NR>1 {print $1}' | sort > "$tmp_remote"
+  say "Only local:"
+  comm -23 "$tmp_local" "$tmp_remote" || true
+  say ""
+  say "Only $target:"
+  comm -13 "$tmp_local" "$tmp_remote" || true
+  say ""
+  say "On both:"
+  comm -12 "$tmp_local" "$tmp_remote" || true
+  rm -f "$tmp_local" "$tmp_remote"
+}
+
+show_model_map() {
+  say "v0.1 simple host/model map"
+  say ""
+  say "Local ($(hostname -s 2>/dev/null || hostname)):"
+  ollama list 2>/dev/null || warn "cannot run local ollama list"
+  say ""
+  if [[ -n "$OBRIDLE_HOSTS" ]]; then
+    printf '%s\n' "$OBRIDLE_HOSTS" | sed '/^[[:space:]]*$/d' | while IFS='|' read -r name user host dir notes; do
+      local target
+      if [[ -n "$user" ]]; then target="$user@$host"; else target="$host"; fi
+      say "--- $name ($target) ---"
+      ssh -o ConnectTimeout=5 "$target" 'ollama list' 2>/dev/null || say "unreachable or ollama not available"
+      say ""
+    done
+  else
+    say "No configured hosts."
+  fi
+}
+
+host_network_menu() {
+  while true; do
+    clear 2>/dev/null || true
+    cat <<'MENU'
+Host/network tools
+
+1. List configured hosts
+2. Add host
+3. Test SSH/Ollama on host
+4. Show disk usage on host
+5. Show Ollama models on host
+6. Compare local models to host
+7. Compare local models to master
+8. Show host/model map
+b. Back
+MENU
+    printf '> '
+    read -r choice
+    case "$choice" in
+      1) list_hosts; pause ;;
+      2) add_host_interactive; pause ;;
+      3) test_host_interactive; pause ;;
+      4) show_disk_usage_host_interactive; pause ;;
+      5) show_models_host_interactive; pause ;;
+      6) compare_local_to_host ""; pause ;;
+      7) compare_local_to_host "$(master_target)"; pause ;;
+      8) show_model_map; pause ;;
+      b|B|q|Q) return 0 ;;
+    esac
+  done
+}
+
+show_disk_usage_host_interactive() {
+  printf 'Host nickname/IP/SSH target: '
+  read -r h
+  local target dir
+  target="$(host_target_from_name "$h")"; target="${target:-$h}"
+  dir="$(host_dir_from_name "$h")"; dir="${dir:-/usr/share/ollama/.ollama/models}"
+  ssh "$target" "df -h /; du -sh '$dir' 2>/dev/null || true"
+}
+
+show_models_host_interactive() {
+  printf 'Host nickname/IP/SSH target: '
+  read -r h
+  local target
+  target="$(host_target_from_name "$h")"; target="${target:-$h}"
+  ssh "$target" 'ollama list'
+}
+
+management_menu() {
+  while true; do
+    clear 2>/dev/null || true
+    cat <<MENU
+Management/settings
+
+1. Show current config values
+2. Show config file path
+3. Edit config with \$EDITOR
+4. Help: config
+b. Back
+MENU
+    printf '> '
+    read -r choice
+    case "$choice" in
+      1) show_current_config; pause ;;
+      2) say "$OBRIDLE_CONFIG"; pause ;;
+      3) "${EDITOR:-nano}" "$OBRIDLE_CONFIG"; load_config ;;
+      4) show_help_region config; pause ;;
+      b|B|q|Q) return 0 ;;
+    esac
+  done
+}
+
+show_current_config() {
+  cat <<MSG
+OBRIDLE_CONFIG=$OBRIDLE_CONFIG
+OBRIDLE_MODELS_DIR=$OBRIDLE_MODELS_DIR
+OBRIDLE_STAGE_DIR=$OBRIDLE_STAGE_DIR
+OBRIDLE_MASTER_NAME=$OBRIDLE_MASTER_NAME
+OBRIDLE_MASTER_USER=$OBRIDLE_MASTER_USER
+OBRIDLE_MASTER_HOST=$OBRIDLE_MASTER_HOST
+OBRIDLE_MASTER_MODELS_DIR=$OBRIDLE_MASTER_MODELS_DIR
+MSG
+  say ""
+  say "Configured hosts:"
+  list_hosts
+}
+
+main_menu() {
+  check_core_deps || pause
+  while true; do
+    clear 2>/dev/null || true
+    cat <<'MENU'
+obridle
+A small LAN model manager for Ollama.
+
+1. Local models
+2. Master models
+3. Copy model from master
+4. Push model to master
+5. Pull model from registry
+6. Remove local model
+7. Host/network tools
+8. Management/settings
+h. Help
+q. Quit
+MENU
+    printf '> '
+    read -r choice
+    case "$choice" in
+      1) local_models_menu ;;
+      2) master_models_menu ;;
+      3) copy_model_from_master ""; pause ;;
+      4) push_model_to_master ""; pause ;;
+      5) pull_model ""; pause ;;
+      6) remove_local_model ""; pause ;;
+      7) host_network_menu ;;
+      8) management_menu ;;
+      h|H) help_menu ;;
+      q|Q) return 0 ;;
+    esac
+  done
+}
+
+usage() {
+  cat <<'MSG'
+obridle - a small LAN model manager for Ollama
+
+Usage:
+  obridle                         open menu
+  obridle menu                    open menu
+  obridle help [region]           show help or region
+  obridle local                   list local models
+  obridle master                  list master models
+  obridle copy MODEL              copy model from master to local
+  obridle push MODEL              push local model to master
+  obridle save MODEL              alias for push
+  obridle pull MODEL              ollama pull MODEL
+  obridle rm MODEL                ollama rm MODEL, after confirmation
+  obridle hosts                   list configured hosts
+  obridle add-host                interactively add host stub
+  obridle test HOST               test ssh/ollama on host
+  obridle compare HOST            compare local models to host
+  obridle map                     show simple host/model map
+  obridle version                 show version
+MSG
+}
+
+main() {
+  load_config
+  local cmd="${1:-menu}"
+  case "$cmd" in
+    menu) main_menu ;;
+    help) if [[ -n "${2:-}" ]]; then show_help_region "$2"; else help_menu; fi ;;
+    local) local_ollama_list ;;
+    master) remote_ollama_list "$(prompt_master_target)" ;;
+    copy) copy_model_from_master "${2:-}" ;;
+    push|save) push_model_to_master "${2:-}" ;;
+    pull) pull_model "${2:-}" ;;
+    rm|remove) remove_local_model "${2:-}" ;;
+    hosts) list_hosts ;;
+    add-host) add_host_interactive ;;
+    test) if [[ -n "${2:-}" ]]; then printf '%s\n' "$2" | { read -r h; target="$(host_target_from_name "$h")"; target="${target:-$h}"; ssh "$target" 'hostname; command -v ollama >/dev/null && ollama list || echo "ollama not found"'; }; else test_host_interactive; fi ;;
+    compare) compare_local_to_host "${2:-}" ;;
+    map) show_model_map ;;
+    version|--version|-v) say "obridle $OBRIDLE_VERSION" ;;
+    -h|--help|usage) usage ;;
+    *) warn "unknown command: $cmd"; usage; return 1 ;;
+  esac
+}
+
+main "$@"
