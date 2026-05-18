@@ -1,0 +1,14 @@
+# Example Obridle config
+
+OBRIDLE_MODELS_DIR="/usr/share/ollama/.ollama/models"
+OBRIDLE_STAGE_DIR="$HOME/.cache/obridle/stage"
+
+OBRIDLE_MASTER_NAME="bigbrainz"
+OBRIDLE_MASTER_USER="koyote"
+OBRIDLE_MASTER_HOST="192.168.1.168"
+OBRIDLE_MASTER_MODELS_DIR="/usr/share/ollama/.ollama/models"
+
+OBRIDLE_HOSTS="
+bigbrainz|koyote|192.168.1.168|/usr/share/ollama/.ollama/models|master RTX3060 12GB
+brainz|koyote|192.168.1.170|/usr/share/ollama/.ollama/models|T1000 8GB
+"

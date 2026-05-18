@@ -8,7 +8,7 @@ It helps move selected Ollama models between Linux hosts without re-downloading 
 
 Obridle is not a model registry, daemon, web UI, Hugging Face manager, or replacement for Ollama. It is a bridle: a small set of reins for a local Ollama model herd.
 
-Version target: v0.1.1 Bash draft.
+Version target: v0.1.2 Bash draft.
 
 Core idea:
   - Ollama knows how to pull, list, and remove models.
@@ -78,6 +78,9 @@ h. Help
      obridle help config
      obridle help copy
      obridle help push
+
+   Help output uses a pager when printed to an interactive terminal.
+   Press q to quit the pager. Set PAGER=cat to disable paging.
 @@END:menu
 
 @@START:config
@@ -252,6 +255,7 @@ Flow:
   4. Rsync the staged files to the master's staging directory.
   5. Ask before installing into the master's real Ollama model store.
   6. Use ssh -t so remote sudo can ask for a password if needed.
+     If sudo asks for a password, it is asking for the remote host's sudo password.
   7. Install staged files into the master's model store.
   8. chown the model store to ollama:ollama when possible.
   9. Restart Ollama when systemctl is available.
@@ -400,6 +404,35 @@ If something is weird, verify manually:
   du -sh /usr/share/ollama/.ollama/models
   find /usr/share/ollama/.ollama/models/manifests -type f | head
 @@END:safety
+
+@@START:pager
+Help Pager
+==========
+
+Obridle help output uses a pager for interactive terminal output.
+
+Default behavior:
+
+  - use $PAGER if set
+  - else use less -R if available
+  - else use more if available
+  - else use cat
+
+Useful keys for less/more:
+
+  q       quit
+  Space   next page
+  b       previous page in less
+  /text   search in less
+
+To disable paging for one command:
+
+  PAGER=cat obridle help config
+
+When help output is piped to another command, Obridle prints normally instead of opening a pager:
+
+  obridle help config | head
+@@END:pager
 
 @@START:project-map
 Project Functionality Map

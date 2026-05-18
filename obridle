@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # obridle - a small LAN model manager for Ollama
-# v0.1.1 draft
+# v0.1.2 draft
 
 set -o pipefail
 
-OBRIDLE_VERSION="0.1.1-draft"
+OBRIDLE_VERSION="0.1.2-draft"
 OBRIDLE_CONFIG="${OBRIDLE_CONFIG:-$HOME/.obridle-config}"
 OBRIDLE_MODELS_DIR="${OBRIDLE_MODELS_DIR:-/usr/share/ollama/.ollama/models}"
 OBRIDLE_STAGE_DIR="${OBRIDLE_STAGE_DIR:-$HOME/.cache/obridle/stage}"
@@ -33,12 +33,22 @@ obridle_page() {
     return
   fi
 
+  local pager_cmd=""
   if [[ -n "${PAGER:-}" ]]; then
-    ${PAGER}
+    pager_cmd="$PAGER"
   elif command -v less >/dev/null 2>&1; then
-    less -R
+    pager_cmd="less -R"
   elif command -v more >/dev/null 2>&1; then
-    more
+    pager_cmd="more"
+  fi
+
+  if [[ -n "$pager_cmd" ]]; then
+    {
+      printf 'obridle help pager: using %s\n' "$pager_cmd"
+      printf 'Tip: press q to quit the pager. Set PAGER=cat to disable paging.\n'
+      printf '\n'
+      cat
+    } | $pager_cmd
   else
     cat
   fi
@@ -221,9 +231,10 @@ Help
 7. SSH, passwords, and keys
 8. Staging and sudo
 9. Safety rules
-10. Project functionality map
-11. Development notes
-12. Worker prompt
+10. Help pager
+11. Project functionality map
+12. Development notes
+13. Worker prompt
 b. Back
 MENU
     printf '> '
@@ -239,9 +250,10 @@ MENU
       7) show_help_region ssh; pause ;;
       8) show_help_region staging; pause ;;
       9) show_help_region safety; pause ;;
-      10) show_help_region project-map; pause ;;
-      11) show_help_region dev-notes; pause ;;
-      12) show_help_region worker-prompt; pause ;;
+      10) show_help_region pager; pause ;;
+      11) show_help_region project-map; pause ;;
+      12) show_help_region dev-notes; pause ;;
+      13) show_help_region worker-prompt; pause ;;
       b|B|q|Q) return 0 ;;
     esac
   done
@@ -441,6 +453,10 @@ push_model_to_master() {
   say "Pushing staged model to $target:~/$remote_stage"
   ssh "$target" "mkdir -p '$remote_stage_models'" || return 1
   rsync -avh --progress "$stage_models/" "$target:$remote_stage_models/" || return 1
+  say ""
+  say "Remote install target: $target"
+  say "Remote model store: $remote_models_dir"
+  say "If sudo asks for a password, enter the sudo password for the remote host above."
   printf 'Install staged model into master Ollama store now over ssh -t? [Y/n] '
   read -r ans
   case "$ans" in
@@ -448,7 +464,7 @@ push_model_to_master() {
       say "Model staged on master at ~/$remote_stage_models"
       ;;
     *)
-      ssh -t "$target" "sudo mkdir -p '$remote_models_dir' && sudo rsync -avh "\$HOME/$remote_stage_models/" '$remote_models_dir/' && sudo chown -R ollama:ollama '$remote_models_dir' 2>/dev/null || true; sudo systemctl restart ollama 2>/dev/null || true; ollama list; rm -rf "\$HOME/$remote_stage""
+      ssh -t "$target" "echo 'obridle remote install on:' \$(hostname 2>/dev/null || echo '$target'); echo 'sudo may ask for the password on this remote host.'; sudo mkdir -p '$remote_models_dir' && sudo rsync -avh \"\$HOME/$remote_stage_models/\" '$remote_models_dir/' && sudo chown -R ollama:ollama '$remote_models_dir' 2>/dev/null || true; sudo systemctl restart ollama 2>/dev/null || true; ollama list; rm -rf \"\$HOME/$remote_stage\""
       rm -rf "$OBRIDLE_STAGE_DIR/to-master"
       ;;
   esac

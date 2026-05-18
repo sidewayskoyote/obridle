@@ -1,14 +1,74 @@
 # Obridle
 
-A small LAN model manager for Ollama homelabs.
+Copy selected Ollama models between LAN hosts without re-downloading them.
+
+Obridle is a small Bash tool for homelab users running Ollama on more than one machine. It follows an Ollama model manifest and syncs only the blobs needed for that model over SSH/rsync.
 
 Ollama is great on one machine. Obridle is for the moment you have several Linux boxes, one slow internet connection, and no desire to download the same model again.
 
-Obridle copies selected Ollama models between LAN hosts by following the model manifest and syncing only the blobs referenced by that manifest. It uses `ssh`, `rsync`, `jq`, and `ollama`.
+## TL;DR
+
+On each Ollama host:
+
+```bash
+sudo apt install rsync openssh-client jq
+sudo usermod -aG ollama "$USER"
+newgrp ollama
+```
+
+Install Obridle:
+
+```bash
+sudo install -m 755 obridle /usr/local/bin/obridle
+sudo install -m 644 obridle-help.txt /usr/local/share/obridle-help.txt
+```
+
+Set up SSH between hosts:
+
+```bash
+ssh-copy-id user@master-host
+ssh user@master-host 'ollama list'
+```
+
+Create or edit `~/.obridle-config`:
+
+```bash
+OBRIDLE_MODELS_DIR="/usr/share/ollama/.ollama/models"
+OBRIDLE_STAGE_DIR="$HOME/.cache/obridle/stage"
+
+OBRIDLE_MASTER_NAME="bigbrainz"
+OBRIDLE_MASTER_USER="koyote"
+OBRIDLE_MASTER_HOST="192.168.1.168"
+OBRIDLE_MASTER_MODELS_DIR="/usr/share/ollama/.ollama/models"
+```
+
+Copy a model from master to local:
+
+```bash
+obridle copy mistral:7b-instruct-q4_K_M
+```
+
+Push a local model to master:
+
+```bash
+obridle push qwen2.5-coder:3b
+```
 
 ## Status
 
-`v0.1.1-draft` — early Bash draft. Useful enough to inspect, test carefully, and iterate.
+`v0.1.2-draft` — early Bash draft. Useful enough to inspect, test carefully, and iterate.
+
+## Scope
+
+Core Obridle is small:
+
+- list local/master models
+- copy one selected model from master to local
+- push one selected model from local to master
+- pull/remove through Ollama
+- show help and basic host tools
+
+Optional helper features such as host/model maps, config sync, and strict one-way mirror mode may exist later, but they should stay subordinate to the core transfer workflow.
 
 ## Non-goals
 
@@ -182,3 +242,26 @@ blobs/
 ```
 
 Obridle copies the manifest and referenced blobs for a selected model.
+
+## License
+
+MIT License. See [LICENSE](LICENSE).
+
+## Roadmap
+
+Near-term:
+
+- clearer remote sudo prompts
+- example config and install snippets
+- shellcheck pass
+- host/model map polish
+- config sync between known hosts
+
+Later:
+
+- strict one-way mirror mode: master → local
+- profiles / desired model sets
+- macOS testing and model-dir autodetection
+- dry-run mode
+- batch/sysadmin mode
+- manual repair tools for broken Ollama stores
