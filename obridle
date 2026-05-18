@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # obridle - a small LAN model manager for Ollama
-# v0.1.0 draft
+# v0.1.1 draft
 
 set -o pipefail
 
-OBRIDLE_VERSION="0.1.0-draft"
+OBRIDLE_VERSION="0.1.1-draft"
 OBRIDLE_CONFIG="${OBRIDLE_CONFIG:-$HOME/.obridle-config}"
 OBRIDLE_MODELS_DIR="${OBRIDLE_MODELS_DIR:-/usr/share/ollama/.ollama/models}"
 OBRIDLE_STAGE_DIR="${OBRIDLE_STAGE_DIR:-$HOME/.cache/obridle/stage}"
@@ -24,6 +24,55 @@ pause() {
 
 say() { printf '%s\n' "$*"; }
 warn() { printf 'obridle: %s\n' "$*" >&2; }
+die() { warn "$*"; return 1; }
+
+obridle_page() {
+  # Page only for interactive terminal output. When piped, print normally.
+  if [[ ! -t 1 ]]; then
+    cat
+    return
+  fi
+
+  if [[ -n "${PAGER:-}" ]]; then
+    ${PAGER}
+  elif command -v less >/dev/null 2>&1; then
+    less -R
+  elif command -v more >/dev/null 2>&1; then
+    more
+  else
+    cat
+  fi
+}
+
+require_readable_file() {
+  local path="$1"
+  local label="${2:-file}"
+
+  if [[ ! -e "$path" ]]; then
+    warn "$label not found: $path"
+    return 1
+  fi
+
+  if [[ ! -r "$path" ]]; then
+    warn "$label exists but is not readable: $path"
+    cat >&2 <<'MSG'
+
+Your user may need access to the ollama group.
+
+Try:
+  groups
+  sudo usermod -aG ollama "$USER"
+  newgrp ollama
+
+Then retry the obridle command. Logging out/in also refreshes group membership.
+
+If group permissions are damaged:
+  sudo chown -R ollama:ollama /usr/share/ollama/.ollama
+  sudo chmod -R g+rX /usr/share/ollama/.ollama
+MSG
+    return 1
+  fi
+}
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1
@@ -145,9 +194,9 @@ show_help_region() {
       $0 == "@@START:" r {flag=1; next}
       $0 == "@@END:" r {flag=0}
       flag {print}
-    ' "$OBRIDLE_HELP_FILE"
+    ' "$OBRIDLE_HELP_FILE" | obridle_page
   else
-    cat <<MSG
+    cat <<MSG | obridle_page
 obridle $OBRIDLE_VERSION
 A small LAN model manager for Ollama.
 
@@ -286,10 +335,7 @@ inspect_local_model_interactive() {
   rel="$(model_to_manifest_relpath "$model")"
   manifest="$OBRIDLE_MODELS_DIR/$rel"
   say "Manifest: $manifest"
-  if [[ ! -f "$manifest" ]]; then
-    warn "manifest not found"
-    return 1
-  fi
+  require_readable_file "$manifest" "local manifest" || return 1
   say "Referenced blobs:"
   blob_files_from_manifest "$manifest" | while read -r blob; do
     [[ -z "$blob" ]] && continue
@@ -345,6 +391,7 @@ copy_model_from_master() {
   mkdir -p "$(dirname "$manifest_stage")" "$stage_models/blobs"
   say "Copying manifest for $model from $target..."
   rsync -avh --progress "$target:$OBRIDLE_MASTER_MODELS_DIR/$rel" "$manifest_stage" || return 1
+  require_readable_file "$manifest_stage" "staged manifest" || return 1
   say "Reading referenced blobs..."
   local blob listfile
   listfile="$OBRIDLE_STAGE_DIR/from-master/blob-list.txt"
@@ -365,7 +412,7 @@ copy_model_from_master() {
 }
 
 push_model_to_master() {
-  local model="$1" target rel manifest stage_models remote_stage remote_models_dir
+  local model="$1" target rel manifest stage_models remote_stage remote_stage_models remote_models_dir local_host
   if [[ -z "$model" ]]; then
     printf 'Model to push to master: '
     read -r model
@@ -374,36 +421,34 @@ push_model_to_master() {
   target="$(prompt_master_target)" || return 1
   rel="$(model_to_manifest_relpath "$model")"
   manifest="$OBRIDLE_MODELS_DIR/$rel"
-  if [[ ! -f "$manifest" ]]; then
-    warn "local manifest not found: $manifest"
-    return 1
-  fi
+  require_readable_file "$manifest" "local manifest" || return 1
   stage_models="$OBRIDLE_STAGE_DIR/to-master/models"
   rm -rf "$OBRIDLE_STAGE_DIR/to-master"
   mkdir -p "$(dirname "$stage_models/$rel")" "$stage_models/blobs"
   cp "$manifest" "$stage_models/$rel"
   while IFS= read -r blob; do
     [[ -z "$blob" ]] && continue
-    if [[ ! -f "$OBRIDLE_MODELS_DIR/$blob" ]]; then
-      warn "missing local blob: $blob"
-      return 1
-    fi
+    require_readable_file "$OBRIDLE_MODELS_DIR/$blob" "local blob" || return 1
     mkdir -p "$stage_models/$(dirname "$blob")"
     cp "$OBRIDLE_MODELS_DIR/$blob" "$stage_models/$blob"
   done < <(blob_files_from_manifest "$manifest")
-  remote_stage="\$HOME/.cache/obridle/stage/incoming-$(hostname -s 2>/dev/null || echo local)"
+  local_host="$(hostname -s 2>/dev/null || echo local)"
+  # Remote stage path is intentionally relative to the remote user's home.
+  # Do not use $HOME here; rsync can treat it literally in remote paths.
+  remote_stage=".cache/obridle/stage/incoming-${local_host}"
+  remote_stage_models="${remote_stage}/models"
   remote_models_dir="$OBRIDLE_MASTER_MODELS_DIR"
-  say "Pushing staged model to $target:$remote_stage"
-  ssh "$target" "mkdir -p $remote_stage"
-  rsync -avh --progress "$stage_models/" "$target:$remote_stage/models/" || return 1
+  say "Pushing staged model to $target:~/$remote_stage"
+  ssh "$target" "mkdir -p '$remote_stage_models'" || return 1
+  rsync -avh --progress "$stage_models/" "$target:$remote_stage_models/" || return 1
   printf 'Install staged model into master Ollama store now over ssh -t? [Y/n] '
   read -r ans
   case "$ans" in
     n|N|no|NO)
-      say "Model staged on master at $remote_stage/models"
+      say "Model staged on master at ~/$remote_stage_models"
       ;;
     *)
-      ssh -t "$target" "sudo mkdir -p '$remote_models_dir' && sudo rsync -avh '$remote_stage/models/' '$remote_models_dir/' && sudo chown -R ollama:ollama '$remote_models_dir' 2>/dev/null || true; sudo systemctl restart ollama 2>/dev/null || true; ollama list; rm -rf '$remote_stage'"
+      ssh -t "$target" "sudo mkdir -p '$remote_models_dir' && sudo rsync -avh "\$HOME/$remote_stage_models/" '$remote_models_dir/' && sudo chown -R ollama:ollama '$remote_models_dir' 2>/dev/null || true; sudo systemctl restart ollama 2>/dev/null || true; ollama list; rm -rf "\$HOME/$remote_stage""
       rm -rf "$OBRIDLE_STAGE_DIR/to-master"
       ;;
   esac
