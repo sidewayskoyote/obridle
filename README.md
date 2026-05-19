@@ -48,6 +48,12 @@ Copy a model from master to local:
 obridle copy mistral:7b-instruct-q4_K_M
 ```
 
+Run a local check:
+
+```bash
+obridle doctor
+```
+
 Push a local model to master:
 
 ```bash
@@ -56,7 +62,7 @@ obridle push qwen2.5-coder:3b
 
 ## Status
 
-`v0.1.2-draft` — early Bash draft. Useful enough to inspect, test carefully, and iterate.
+`v0.1.3-draft` — early Bash draft. Useful enough to inspect, test carefully, and iterate.
 
 ## Scope
 
@@ -180,6 +186,12 @@ Remove a local model through Ollama:
 obridle rm wizard-vicuna-uncensored:30b
 ```
 
+Run doctor:
+
+```bash
+obridle doctor
+```
+
 Show a help region:
 
 ```bash
@@ -187,6 +199,21 @@ obridle help config
 obridle help storage
 obridle help worker-prompt
 ```
+
+## Optional setup helpers
+
+The `examples/` directory contains copy/paste helper scripts.
+
+The normal install path is still explicit:
+
+```bash
+sudo install -m 755 obridle /usr/local/bin/obridle
+sudo install -m 644 obridle-help.txt /usr/local/share/obridle-help.txt
+```
+
+`examples/setup-local-lazy.sh` is intentionally marked experimental. It prints what it wants to do, asks before sudo actions, and is meant for testing convenience rather than blind production use.
+
+For careful users, read the script first and run the individual commands yourself.
 
 ## Config
 
@@ -251,7 +278,7 @@ MIT License. See [LICENSE](LICENSE).
 
 Near-term:
 
-- clearer remote sudo prompts
+- doctor command polish
 - example config and install snippets
 - shellcheck pass
 - host/model map polish

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # obridle - a small LAN model manager for Ollama
-# v0.1.2 draft
+# v0.1.3 draft
 
 set -o pipefail
 
-OBRIDLE_VERSION="0.1.2-draft"
+OBRIDLE_VERSION="0.1.3-draft"
 OBRIDLE_CONFIG="${OBRIDLE_CONFIG:-$HOME/.obridle-config}"
 OBRIDLE_MODELS_DIR="${OBRIDLE_MODELS_DIR:-/usr/share/ollama/.ollama/models}"
 OBRIDLE_STAGE_DIR="${OBRIDLE_STAGE_DIR:-$HOME/.cache/obridle/stage}"
@@ -106,6 +106,82 @@ Ollama is also required for local list, pull, and remove operations.
 MSG
     return 1
   fi
+}
+
+
+doctor_report() {
+  local problems=0 target="" master_ok="skip" model_dir_state="missing" group_state="unknown" stage_state="unknown" help_state="missing"
+
+  printf 'Obridle doctor (%s)\n' "$OBRIDLE_VERSION"
+  printf 'Host: %s\n' "$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown)"
+  printf '\nCore commands:\n'
+  for cmd in bash ssh rsync jq; do
+    if need_cmd "$cmd"; then
+      printf '  [OK]   %-8s %s\n' "$cmd" "$(command -v "$cmd")"
+    else
+      printf '  [MISS] %-8s not found\n' "$cmd"
+      problems=$((problems + 1))
+    fi
+  done
+  if need_cmd ollama; then
+    printf '  [OK]   %-8s %s\n' "ollama" "$(command -v ollama)"
+  else
+    printf '  [WARN] %-8s not found; local list/pull/rm will not work here\n' "ollama"
+  fi
+
+  printf '\nLocal store:\n'
+  if [[ -d "$OBRIDLE_MODELS_DIR" ]]; then
+    if [[ -r "$OBRIDLE_MODELS_DIR" && -x "$OBRIDLE_MODELS_DIR" ]]; then
+      model_dir_state="readable"; printf '  [OK]   models dir readable: %s\n' "$OBRIDLE_MODELS_DIR"
+    else
+      model_dir_state="not-readable"; printf '  [WARN] models dir exists but is not readable/searchable: %s\n' "$OBRIDLE_MODELS_DIR"; problems=$((problems + 1))
+    fi
+  else
+    printf '  [WARN] models dir missing: %s\n' "$OBRIDLE_MODELS_DIR"; problems=$((problems + 1))
+  fi
+  if groups 2>/dev/null | grep -qw ollama; then
+    group_state="yes"; printf '  [OK]   current shell is in group: ollama\n'
+  else
+    group_state="no"; printf '  [WARN] current shell is not in group: ollama\n'
+  fi
+  if mkdir -p "$OBRIDLE_STAGE_DIR" 2>/dev/null && [[ -w "$OBRIDLE_STAGE_DIR" ]]; then
+    stage_state="writable"; printf '  [OK]   stage dir writable: %s\n' "$OBRIDLE_STAGE_DIR"
+  else
+    stage_state="not-writable"; printf '  [WARN] stage dir not writable: %s\n' "$OBRIDLE_STAGE_DIR"; problems=$((problems + 1))
+  fi
+
+  printf '\nHelp/config:\n'
+  if find_help_file; then help_state="found"; printf '  [OK]   help file: %s\n' "$OBRIDLE_HELP_FILE"; else printf '  [WARN] help file not found\n'; fi
+  if [[ -f "$OBRIDLE_CONFIG" ]]; then printf '  [OK]   config file: %s\n' "$OBRIDLE_CONFIG"; else printf '  [INFO] config file not found yet: %s\n' "$OBRIDLE_CONFIG"; fi
+
+  printf '\nMaster:\n'
+  if target="$(master_target)"; then
+    printf '  [INFO] master target: %s\n' "$target"
+    printf '  [INFO] master store:  %s\n' "$OBRIDLE_MASTER_MODELS_DIR"
+    if ssh -o BatchMode=yes -o ConnectTimeout=5 "$target" 'command -v ollama >/dev/null && ollama list >/dev/null' 2>/dev/null; then
+      master_ok="yes"; printf '  [OK]   passwordless SSH + ollama list works\n'
+    else
+      master_ok="manual"; printf '  [WARN] passwordless SSH/ollama check failed\n'; printf '         This may be fine if the host needs a password. Test manually:\n'; printf '           ssh %s '\''hostname; ollama list'\''\n' "$target"
+    fi
+  else
+    printf '  [INFO] no master configured yet\n'
+  fi
+
+  printf '\nSummary:\n'
+  printf '  model_dir=%s group_ollama=%s stage=%s help=%s master=%s problems=%s\n' "$model_dir_state" "$group_state" "$stage_state" "$help_state" "$master_ok" "$problems"
+  if [[ "$problems" -ne 0 ]]; then
+    printf '\nSuggested fixes:\n'
+    printf '  sudo apt install rsync openssh-client jq\n'
+    printf '  sudo usermod -aG ollama "$USER"\n'
+    printf '  newgrp ollama   # or log out/in\n'
+    printf '  obridle help ssh\n'
+    return 1
+  fi
+  return 0
+}
+
+run_doctor() {
+  doctor_report | obridle_page
 }
 
 load_config() {
@@ -232,9 +308,10 @@ Help
 8. Staging and sudo
 9. Safety rules
 10. Help pager
-11. Project functionality map
-12. Development notes
-13. Worker prompt
+11. Doctor
+12. Project functionality map
+13. Development notes
+14. Worker prompt
 b. Back
 MENU
     printf '> '
@@ -251,9 +328,10 @@ MENU
       8) show_help_region staging; pause ;;
       9) show_help_region safety; pause ;;
       10) show_help_region pager; pause ;;
-      11) show_help_region project-map; pause ;;
-      12) show_help_region dev-notes; pause ;;
-      13) show_help_region worker-prompt; pause ;;
+      11) show_help_region doctor; pause ;;
+      12) show_help_region project-map; pause ;;
+      13) show_help_region dev-notes; pause ;;
+      14) show_help_region worker-prompt; pause ;;
       b|B|q|Q) return 0 ;;
     esac
   done
@@ -332,6 +410,8 @@ MENU
     read -r choice
     case "$choice" in
       1) remote_ollama_list "$target"; pause ;;
+      # shellcheck disable=SC2029
+      # Intentionally expanding configured remote path locally before sending over ssh.
       2) ssh "$target" "du -sh '$OBRIDLE_MASTER_MODELS_DIR'"; pause ;;
       3) inspect_remote_model_interactive "$target" "$OBRIDLE_MASTER_MODELS_DIR"; pause ;;
       b|B|q|Q) return 0 ;;
@@ -451,6 +531,8 @@ push_model_to_master() {
   remote_stage_models="${remote_stage}/models"
   remote_models_dir="$OBRIDLE_MASTER_MODELS_DIR"
   say "Pushing staged model to $target:~/$remote_stage"
+  # shellcheck disable=SC2029
+  # Intentionally expanding remote stage path locally before sending over ssh.
   ssh "$target" "mkdir -p '$remote_stage_models'" || return 1
   rsync -avh --progress "$stage_models/" "$target:$remote_stage_models/" || return 1
   say ""
@@ -645,6 +727,8 @@ show_disk_usage_host_interactive() {
   local target dir
   target="$(host_target_from_name "$h")"; target="${target:-$h}"
   dir="$(host_dir_from_name "$h")"; dir="${dir:-/usr/share/ollama/.ollama/models}"
+  # shellcheck disable=SC2029
+  # Intentionally expanding configured remote path locally before sending over ssh.
   ssh "$target" "df -h /; du -sh '$dir' 2>/dev/null || true"
 }
 
@@ -674,7 +758,8 @@ MENU
       1) show_current_config; pause ;;
       2) say "$OBRIDLE_CONFIG"; pause ;;
       3) "${EDITOR:-nano}" "$OBRIDLE_CONFIG"; load_config ;;
-      4) show_help_region config; pause ;;
+      4) run_doctor; pause ;;
+      5) show_help_region config; pause ;;
       b|B|q|Q) return 0 ;;
     esac
   done
@@ -751,6 +836,7 @@ Usage:
   obridle test HOST               test ssh/ollama on host
   obridle compare HOST            compare local models to host
   obridle map                     show simple host/model map
+  obridle doctor                  run local configuration/dependency checks
   obridle version                 show version
 MSG
 }
@@ -772,6 +858,7 @@ main() {
     test) if [[ -n "${2:-}" ]]; then printf '%s\n' "$2" | { read -r h; target="$(host_target_from_name "$h")"; target="${target:-$h}"; ssh "$target" 'hostname; command -v ollama >/dev/null && ollama list || echo "ollama not found"'; }; else test_host_interactive; fi ;;
     compare) compare_local_to_host "${2:-}" ;;
     map) show_model_map ;;
+    doctor) run_doctor ;;
     version|--version|-v) say "obridle $OBRIDLE_VERSION" ;;
     -h|--help|usage) usage ;;
     *) warn "unknown command: $cmd"; usage; return 1 ;;
